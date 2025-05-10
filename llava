@@ -1,0 +1,102 @@
+import requests
+from PIL import Image
+import os
+os.environ["CUDA_VISIBLE_DEVICES"]="0"
+import torch
+from transformers import AutoProcessor, LlavaForConditionalGeneration
+import csv
+import tqdm
+import json
+import pandas as pd
+from vllm import LLM, SamplingParams
+
+test_file_path = "/home/qkli/VQA/EchoSight/evqa_data/test.csv"
+test_file = pd.read_csv(test_file_path)
+
+model_id = "/home/qkli/huggingface/model/llava-hf/llava-1.5-7b-hf"
+iNat_image_path = "/home/qkli/47data/vqa_data/evqa/iNaturalist/id_name"
+with open(iNat_image_path + "/train_id2name.json", "r") as f:
+    iNat_id2name = json.load(f)
+
+
+
+def get_image(image_id, dataset_name, iNat_id2name=None):
+
+    GLD_image_path = "/home/qkli/47data/vqa_data/evqa/landmark/train" 
+    iNat_image_path = "/home/qkli/47data/vqa_data/evqa/iNaturalist"
+    infoseek_test_path = "/home/qkli/47data/vqa_data/infoseek/images/infoseek_val"
+    infoseek_train_path = "/home/qkli/47data/vqa_data/infoseek/images/infoseek_train"
+    """_summary_
+        get the image file by image_id. image id are indexed by its first 3 letters in the corresponding folder. e.g. image_id = "abcde" will be stored in "a/b/c/abcde.jpg"
+    Args:
+        image_id : the image id
+    """
+    
+    if dataset_name == "inaturalist":
+        file_name = iNat_id2name[image_id]
+        
+        image_path = os.path.join(iNat_image_path, file_name)
+    elif dataset_name == "landmarks":
+        image_path = os.path.join(GLD_image_path, image_id[0], image_id[1], image_id[2], image_id + ".jpg")
+    elif dataset_name == "infoseek":
+        if os.path.exists(os.path.join(infoseek_test_path, image_id + ".jpg")):
+            image_path = os.path.join(infoseek_test_path, image_id + ".jpg")
+        elif os.path.exists(os.path.join(infoseek_test_path, image_id + ".JPEG")):
+            image_path = os.path.join(infoseek_test_path, image_id + ".JPEG")
+    else:
+        raise NotImplementedError("dataset name not supported")
+    return image_path
+
+llm = LLM(model=model_id)
+sampling_params = SamplingParams(max_tokens=200,temperature=0.0)
+
+test_file["llava_reasoning"] = ""
+test_file["image_path"] = ""
+# Prepare batch inputs
+batch_prompts = []
+batch_images = []
+batch_indices = []
+
+for i, test_example in tqdm.tqdm(test_file.iterrows()):
+    question = test_example["question"]
+    image_path = get_image(
+            str(test_example["dataset_image_ids"]).split("|")[0],
+            str(test_example["dataset_name"]),
+            iNat_id2name,
+        )
+    # prompt = f"USER: <image>\n Question:{{{question}}}.\nIdentify the objects in the image related to the Question.\nASSISTANT:"
+    prompt = f"USER: <image>\nQuestion: {{{question}}}.\n Please think step by step:\n\
+(1) Identify key visual elements related to the question: <list relevant objects>\n\
+\
+(2) Based on the visual context, the information needed for a good answer to the question should include: <describe required knowledge>\n\
+Follow this exact output format:\
+(1) Key visual elements:\
+(2) Required knowledge for a good answer:\
+\nASSISTANT:"
+    image = Image.open(image_path)
+    test_file.at[i, "image_path"] = image_path
+    # with Image.open(image_path) as image:
+    #     batch_prompts.append(prompt)
+    #     batch_images.append(image.copy())
+    #     batch_indices.append(i)
+    with Image.open(image_path) as img:
+        batch_images.append(img.copy())
+        batch_prompts.append(prompt)
+        batch_indices.append(i)
+    
+    
+
+# Perform batch inference
+batch_inputs = [
+    {"prompt": prompt, "multi_modal_data": {"image": image}}
+    for prompt, image in zip(batch_prompts, batch_images)
+]
+outputs = llm.generate(batch_inputs, sampling_params=sampling_params)
+
+# Assign results back to test_file
+for idx, output in zip(batch_indices, outputs):
+    generated_text = output.outputs[0].text
+    test_file.at[idx, "llava_reasoning"] = generated_text
+
+# Save results
+test_file.to_csv("./test_llava_reasoning.csv", index=False)
